@@ -16,6 +16,7 @@ import click_confirm_attack
 import click_result_return
 import auto_crab
 import battle_attack_profile
+import debug_settings
 import landing_geometry
 import skip_doctor_dialog
 import template_click
@@ -37,6 +38,20 @@ class OfflineVisionTests(unittest.TestCase):
 
     def tearDown(self):
         template_click.SEARCH_REGION = self.old_search_region
+
+    def test_automatic_error_screenshot_writes_are_disabled(self):
+        self.assertFalse(debug_settings.SAVE_ERROR_SCREENSHOTS)
+        screen = np.zeros((720, 1280, 3), dtype=np.uint8)
+        match = battle_attack_profile.MatchResult(0.0, 0, 0, 10, 10)
+        with mock.patch.object(cv2, "imencode", side_effect=AssertionError("must not encode")), \
+             mock.patch.object(auto_crab.battle_attack_profile, "adb_screenshot",
+                               side_effect=AssertionError("must not capture")):
+            self.assertIsNone(auto_crab.save_error_screenshot("test"))
+            self.assertIsNone(battle_attack_profile.save_beach_debug(screen, match, "test"))
+            self.assertIsNone(battle_attack_profile.save_beach_debug_records([], "测试"))
+            self.assertIsNone(troop_status.save_debug(screen[:80, :416], "test"))
+            self.assertIsNone(template_click.save_debug_match(screen, match, PROJECT_ROOT / "unused.png"))
+            self.assertIsNone(skip_doctor_dialog.save_debug(screen))
 
     def test_crab_color_detector_accepts_real_crab(self):
         screen = read_image("screenshots/raw/crab_entry_next_stage.png")
@@ -265,7 +280,7 @@ class OfflineVisionTests(unittest.TestCase):
         match = battle_attack_profile.find_beach(gray_screen, preferred_point=(495, 314))
         self.assertLess(match.score, battle_attack_profile.BEACH_MATCH_THRESHOLD)
 
-    def test_stage47_search_two_boats_then_hero_uses_visible_apron(self):
+    def test_stage47_hero_lands_last_at_same_point_as_troops(self):
         folder = PROJECT_ROOT / "tests/fixtures/stage47_hero_occlusion"
         frames = [read_image(folder / f"raw_{name}_{i}.png")
                   for name in ("left_bottom", "hero_selected") for i in range(1, 5)]
@@ -277,18 +292,16 @@ class OfflineVisionTests(unittest.TestCase):
              mock.patch.object(battle_attack_profile.time, "sleep"):
             point = battle_attack_profile.search_landing_point(reference_out=reference)
             battle_attack_profile.deploy_units_in_order(point, landing_reference=reference)
-        self.assertEqual(capture.call_count, 6)
+        self.assertEqual(capture.call_count, 4)
         self.assertTrue(np.array_equal(reference["screen"], frames[3]))
         calls = tap.call_args_list
         self.assertEqual(calls[0].args[0], battle_attack_profile.TROOP_CARD_POINTS[0])
         self.assertEqual(calls[2].args[0], battle_attack_profile.TROOP_CARD_POINTS[1])
-        self.assertEqual(calls[4].args[0], battle_attack_profile.HERO_CARD_POINT)
-        hero_point = calls[5].args[0]
-        self.assertNotEqual(hero_point, point)
-        self.assertTrue(815 <= hero_point[0] <= 855 and 445 <= hero_point[1] <= 475, hero_point)
-        for frame in frames[4:6]:
-            _, gray, _, allowed = landing_geometry.scene_masks(frame)
-            self.assertTrue(landing_geometry.has_clear_landing_patch(hero_point, gray, allowed))
+        self.assertEqual(calls[16].args[0], battle_attack_profile.HERO_CARD_POINT)
+        hero_point = calls[17].args[0]
+        self.assertEqual(calls[1].args[0], point)
+        self.assertEqual(calls[3].args[0], point)
+        self.assertEqual(hero_point, point)
 
     def test_stage47_occlusion_recovery_validates_all_hero_frames(self):
         folder = PROJECT_ROOT / "tests/fixtures/stage47_hero_occlusion"
@@ -316,24 +329,23 @@ class OfflineVisionTests(unittest.TestCase):
         far_shift = cv2.warpAffine(reference, np.float32([[1, 0, 120], [0, 1, 0]]), (1280, 720))
         self.assertIsNone(landing_geometry.recover_occluded_zone(far_shift, reference, zone))
 
-    def test_hero_rechecks_selected_frame_and_uses_fresh_point(self):
-        hit = battle_attack_profile.MatchResult(0.9, 610, 410, 100, 60)
+    def test_hero_uses_first_two_boats_landing_point_without_recheck(self):
         with mock.patch.object(battle_attack_profile, "tap") as tap, \
-             mock.patch.object(battle_attack_profile, "detect_landing_point", return_value=hit), \
-             mock.patch.object(battle_attack_profile, "save_beach_debug_records"), \
+             mock.patch.object(battle_attack_profile, "detect_landing_point") as detect, \
              mock.patch.object(battle_attack_profile.time, "sleep"):
             battle_attack_profile.deploy_hero((900, 200))
-        self.assertEqual(tap.call_args_list[-1].args[0], (660, 440))
+        self.assertEqual(tap.call_args_list[-1].args[0], (900, 200))
+        detect.assert_not_called()
 
-    def test_hero_does_not_click_stale_point_if_recheck_fails(self):
-        miss = battle_attack_profile.MatchResult(0, 0, 0, 0, 0)
+    def test_first_two_boats_and_hero_receive_identical_landing_point(self):
+        point = (777, 444)
         with mock.patch.object(battle_attack_profile, "tap") as tap, \
-             mock.patch.object(battle_attack_profile, "detect_landing_point", return_value=miss), \
-             mock.patch.object(battle_attack_profile, "save_beach_debug_records"), \
+             mock.patch.object(battle_attack_profile, "release_initial_hero_skill_once"), \
              mock.patch.object(battle_attack_profile.time, "sleep"):
-            with self.assertRaises(RuntimeError):
-                battle_attack_profile.deploy_hero((900, 200))
-        self.assertEqual(tap.call_count, 1)
+            battle_attack_profile.deploy_units_in_order(point)
+        self.assertEqual(tap.call_args_list[1].args[0], point)
+        self.assertEqual(tap.call_args_list[3].args[0], point)
+        self.assertEqual(tap.call_args_list[17].args[0], point)
 
     def test_landing_search_moves_left_center_right_in_order(self):
         misses_then_hit = [
@@ -403,7 +415,7 @@ class OfflineVisionTests(unittest.TestCase):
 
         self.assertEqual([call.args[0] for call in run_stage.call_args_list], [1, 2])
 
-    def test_map_view_moves_only_when_crab_entry_missing(self):
+    def test_missing_crab_retries_without_moving_map(self):
         screen = read_image("screenshots/raw/crab_entry_next_stage.png")
         with mock.patch.object(
             auto_crab.battle_attack_profile,
@@ -414,29 +426,17 @@ class OfflineVisionTests(unittest.TestCase):
                 with mock.patch.object(auto_crab.battle_attack_profile, "run_adb") as run_adb:
                     with mock.patch.object(auto_crab.time, "sleep"), \
                          mock.patch.object(auto_crab, "find_crab_entry", return_value=mock.Mock(score=0.3)):
-                        result = auto_crab.move_map_view_bottom_right()
+                        with self.assertRaisesRegex(RuntimeError, "check_crab_entry"):
+                            auto_crab.retry_step("check_crab_entry", auto_crab.check_crab_entry)
 
-        self.assertTrue(result)
-        start_x, start_y, end_x, end_y, duration_ms = auto_crab.MAP_VIEW_BOTTOM_RIGHT_SWIPE
-        self.assertLess(end_x, start_x)
-        self.assertLess(end_y, start_y)
-        run_adb.assert_called_once_with(
-            "shell",
-            "input",
-            "swipe",
-            str(start_x),
-            str(start_y),
-            str(end_x),
-            str(end_y),
-            str(duration_ms),
-        )
+        run_adb.assert_not_called()
 
     def test_visible_crab_skips_map_swipe(self):
         screen = read_image("screenshots/raw/crab_entry_next_stage.png")
         with mock.patch.object(auto_crab.battle_attack_profile, "adb_screenshot", return_value=screen), \
              mock.patch.object(auto_crab, "is_on_crab_attack_page", return_value=False), \
              mock.patch.object(auto_crab.battle_attack_profile, "run_adb") as run_adb:
-            self.assertTrue(auto_crab.move_map_view_bottom_right())
+            self.assertTrue(auto_crab.check_crab_entry())
         run_adb.assert_not_called()
 
     def test_known_ui_templates(self):
