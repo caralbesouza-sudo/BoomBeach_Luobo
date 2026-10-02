@@ -5,6 +5,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import debug_settings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -241,6 +242,8 @@ def adb_tap(x, y):
 
 
 def save_debug_match(screen, match, output_path):
+    if not debug_settings.SAVE_ERROR_SCREENSHOTS:
+        return None
     debug = screen.copy()
     cv2.rectangle(
         debug,
@@ -272,8 +275,10 @@ def main():
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     debug_path = PROJECT_ROOT / "screenshots" / "errors" / f"template_match_{timestamp}.png"
-    save_debug_match(screen, match, debug_path)
-    print(f"已保存调试图：{debug_path}")
+    if save_debug_match(screen, match, debug_path) is not None:
+        print(f"已保存调试图：{debug_path}")
+    else:
+        print("调试截图保存已关闭。")
 
     if match.score < MATCH_THRESHOLD:
         print("匹配分数低于阈值，暂不点击。")

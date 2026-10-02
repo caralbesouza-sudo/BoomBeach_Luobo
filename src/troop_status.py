@@ -6,6 +6,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import debug_settings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -119,6 +120,8 @@ def build_signature(crop):
 
 
 def save_debug(crop, label):
+    if not debug_settings.SAVE_ERROR_SCREENSHOTS:
+        return None
     output_dir = PROJECT_ROOT / "screenshots" / "errors"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"troop_status_{label}_{time.strftime('%Y%m%d_%H%M%S')}.png"

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import debug_settings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -162,6 +163,8 @@ def adb_tap(x, y):
 
 
 def save_debug(screen, match):
+    if not debug_settings.SAVE_ERROR_SCREENSHOTS:
+        return None
     debug = screen.copy()
     sx, sy, sw, sh = SEARCH_REGION
     cv2.rectangle(debug, (sx, sy), (sx + sw, sy + sh), (255, 0, 0), 2)

@@ -8,7 +8,9 @@ import cv2
 import numpy as np
 
 import click_result_return
+import debug_settings
 import landing_geometry
+import map_zoom
 
 
 ADB_PATH = "adb"
@@ -52,20 +54,25 @@ TROOP_LANDING_POINTS = []
 ROBOT_SKILL_POINT = (1030, 565)
 ROBOT_TARGET_POINTS = []
 ROBOT_HERO_CYCLE_ROUNDS = 6
-FIRST_HERO_SKILL_SECONDS = 20
-FIRST_ROBOT_SKILL_SECONDS = 10
-NEXT_HERO_SKILL_SECONDS = 10
-NEXT_ROBOT_SKILL_SECONDS = 5
+FIRST_HERO_SKILL_SECONDS = 3
+NEXT_HERO_SKILL_SECONDS = 3
 RESULT_CHECK_INTERVAL_SECONDS = 1.0
 
 # 震爆弹：技能按钮坐标 + 释放目标点。没有就保持空。
 SHOCK_SKILL_POINT = None
 SHOCK_TARGET_POINTS = []
 
-WAIT_AFTER_CARD_SELECT_SECONDS = 0.25
-WAIT_AFTER_DEPLOY_SECONDS = 0.35
+DEPLOY_INTERVAL_SECONDS = 0.4
+WAIT_AFTER_CARD_SELECT_SECONDS = 0.12
 WAIT_AFTER_HERO_DEPLOY_SECONDS = 1.0
-HERO_SKILL_TAP_INTERVAL_SECONDS = 0.12
+WAIT_AFTER_OPENING_ROBOT_SECONDS = 1.0
+
+TRIPLE_SPEED_TEMPLATE = PROJECT_ROOT / "screenshots" / "templates" / "3bei.png"
+# 1280x720 下撤退按钮的下方，避免搜索到技能卡片和地图图案。
+TRIPLE_SPEED_SEARCH_REGION = (1080, 65, 200, 90)
+TRIPLE_SPEED_MATCH_THRESHOLD = 0.90
+TRIPLE_SPEED_ATTEMPTS = 3
+TRIPLE_SPEED_RETRY_SECONDS = 0.4
 
 BEACH_TEMPLATE = PROJECT_ROOT / "screenshots" / "templates" / "beach_landing_sample_1.png"
 BEACH_MATCH_THRESHOLD = 0.55
@@ -399,6 +406,8 @@ def landing_zone_match(zone, method="verified_landing_zone"):
 
 
 def save_beach_debug(screen, match, step_name):
+    if not debug_settings.SAVE_ERROR_SCREENSHOTS:
+        return None
     debug = screen.copy()
     cv2.rectangle(
         debug,
@@ -458,6 +467,9 @@ def detect_landing_point(step_name, debug_records, landing_reference=None):
 
 
 def save_beach_debug_records(debug_records, result_label):
+    if not debug_settings.SAVE_ERROR_SCREENSHOTS:
+        print(f"海滩识别{result_label}，调试截图保存已关闭。")
+        return None
     output_dir = BEACH_DEBUG_DIR / BEACH_DEBUG_STAGE_NAME
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -499,7 +511,7 @@ def search_landing_point(reference_out=None):
     raise RuntimeError("左下方、正下方、右下方都没有识别到海滩，暂不下兵。")
 
 
-def tap(point, label):
+def tap(point, label, settle_seconds=0.12):
     if point is None:
         raise ValueError(f"{label} 坐标还没有填写。")
     x, y = point
@@ -507,7 +519,8 @@ def tap(point, label):
         raise ValueError(f"{label} 坐标超出屏幕范围：{point}")
     print(f"点击 {label}: ({x}, {y})")
     run_adb("shell", "input", "tap", str(int(x)), str(int(y)))
-    time.sleep(0.12)
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
 
 
 def swipe(action, label):
@@ -529,47 +542,84 @@ def swipe(action, label):
 def validate_profile():
     if not BEACH_TEMPLATE.exists():
         raise FileNotFoundError(f"海滩模板不存在：{BEACH_TEMPLATE}")
+    template = read_image(TRIPLE_SPEED_TEMPLATE)
+    _, _, width, height = TRIPLE_SPEED_SEARCH_REGION
+    if template.shape[0] > height or template.shape[1] > width:
+        raise ValueError("3bei.png 必须是 1280x720 画面中裁出的三倍速按钮，不能是完整截图。")
+
+
+def deploy_card(card_point, landing_point, card_label, landing_label):
+    started_at = time.monotonic()
+    tap(card_point, card_label, settle_seconds=0)
+    time.sleep(WAIT_AFTER_CARD_SELECT_SECONDS)
+    tap(landing_point, landing_label, settle_seconds=0)
+    # 每船总节奏包含两次 ADB 点击及选卡等待；设备较慢时不叠加额外等待。
+    remaining = DEPLOY_INTERVAL_SECONDS - (time.monotonic() - started_at)
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def deploy_hero(landing_point, landing_reference=None):
-    tap(HERO_CARD_POINT, "英雄卡片")
-    time.sleep(WAIT_AFTER_CARD_SELECT_SECONDS)
-    records = []
-    match = detect_landing_point("hero_selected", records, landing_reference=landing_reference)
-    if match.score < BEACH_MATCH_THRESHOLD:
-        save_beach_debug_records(records, "英雄登陆复核失败")
-        raise RuntimeError("选中英雄后未确认可登陆区域，已停止下兵；请查看 hero_selected 调试图。")
-    save_beach_debug_records(records, "英雄登陆复核成功")
-    tap(match.center, "英雄登陆点（选中后重新定位）")
-    time.sleep(WAIT_AFTER_DEPLOY_SECONDS)
+    # 英雄最后登陆，复用普通登陆艇已经确认的登陆坐标。
+    # 选中英雄后重新识别会受已登陆部队遮挡，容易把英雄点击到另一处。
+    deploy_card(HERO_CARD_POINT, landing_point, "英雄卡片", "英雄登陆点（与普通登陆艇相同）")
 
 
-def release_hero_skill_twice():
+def release_initial_hero_skill_once():
     print(f"等待 {WAIT_AFTER_HERO_DEPLOY_SECONDS} 秒后释放英雄技能。")
     time.sleep(WAIT_AFTER_HERO_DEPLOY_SECONDS)
-    tap(HERO_CARD_POINT, "英雄技能 1")
-    time.sleep(HERO_SKILL_TAP_INTERVAL_SECONDS)
-    tap(HERO_CARD_POINT, "英雄技能 2")
-    time.sleep(WAIT_AFTER_DEPLOY_SECONDS)
+    released_at = time.monotonic()
+    tap(HERO_CARD_POINT, "英雄登陆后技能（一次）")
+    return released_at
 
 
 def deploy_troop(index, landing_point):
     card_point = TROOP_CARD_POINTS[index - 1]
-    tap(card_point, f"兵种卡片 {index}")
-    time.sleep(WAIT_AFTER_CARD_SELECT_SECONDS)
-    tap(landing_point, f"兵种 {index} 登陆点")
-    time.sleep(WAIT_AFTER_DEPLOY_SECONDS)
+    deploy_card(card_point, landing_point, f"兵种卡片 {index}", f"兵种 {index} 登陆点")
 
 
 def deploy_units_in_order(landing_point, landing_reference=None):
-    for index in [1, 2]:
+    for index in range(1, len(TROOP_CARD_POINTS) + 1):
         deploy_troop(index, landing_point)
 
     deploy_hero(landing_point, landing_reference=landing_reference)
-    release_hero_skill_twice()
+    last_hero_at = release_initial_hero_skill_once()
+    release_robot_round(2, landing_point)
+    return last_hero_at
 
-    for index in [3, 4, 5, 6, 7, 8]:
-        deploy_troop(index, landing_point)
+
+def find_triple_speed_button(screen):
+    if screen is None or screen.shape != (720, 1280, 3):
+        return MatchResult(0.0, 0, 0, 0, 0, "invalid_screen")
+    template = read_image(TRIPLE_SPEED_TEMPLATE)
+    x, y, width, height = TRIPLE_SPEED_SEARCH_REGION
+    region = screen[y:y+height, x:x+width]
+    if template.shape[0] > height or template.shape[1] > width:
+        raise ValueError("三倍速模板超出搜索区域。")
+    result = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, location = cv2.minMaxLoc(result)
+    return MatchResult(float(score), x + location[0], y + location[1],
+                       template.shape[1], template.shape[0], "triple_speed_button")
+
+
+def enable_triple_speed():
+    for attempt in range(1, TRIPLE_SPEED_ATTEMPTS + 1):
+        screen = adb_screenshot()
+        result = click_result_return.find_template(screen)
+        if result.score >= click_result_return.MATCH_THRESHOLD:
+            print("已进入结算页，跳过三倍速。")
+            return False
+        match = find_triple_speed_button(screen)
+        print(f"三倍速按钮 {attempt}/{TRIPLE_SPEED_ATTEMPTS}：score={match.score:.3f}")
+        if match.score >= TRIPLE_SPEED_MATCH_THRESHOLD:
+            # 只点击一次；不因图标仍显示而重试，避免把加速再次关闭。
+            tap(match.center, "开启三倍速")
+            print("已点击三倍速按钮。")
+            return True
+        if attempt < TRIPLE_SPEED_ATTEMPTS:
+            time.sleep(TRIPLE_SPEED_RETRY_SECONDS)
+    print("未识别到三倍速按钮，继续等待战斗结果。")
+    return False
 
 
 def release_robot_round(round_index, landing_point):
@@ -613,24 +663,26 @@ def wait_before_next_action(seconds, label):
         time.sleep(min(RESULT_CHECK_INTERVAL_SECONDS, remaining))
 
 
-def release_robot_hero_cycle(landing_point):
+def release_robot_hero_cycle(landing_point, last_hero_at=None):
+    if last_hero_at is None:
+        last_hero_at = time.monotonic()
     for round_index in range(1, ROBOT_HERO_CYCLE_ROUNDS + 1):
-        hero_wait = FIRST_HERO_SKILL_SECONDS if round_index == 1 else NEXT_HERO_SKILL_SECONDS
-        robot_wait = FIRST_ROBOT_SKILL_SECONDS if round_index == 1 else NEXT_ROBOT_SKILL_SECONDS
+        interval = FIRST_HERO_SKILL_SECONDS if round_index == 1 else NEXT_HERO_SKILL_SECONDS
+        # 以相邻两次英雄点击为间隔，计入机械小兵、三倍速和 ADB 操作耗时。
+        hero_wait = max(0.0, last_hero_at + interval - time.monotonic())
 
         if not wait_before_next_action(hero_wait, "释放英雄技能"):
             return
 
         try:
+            last_hero_at = time.monotonic()
             release_cycle_hero_skill(round_index)
         except Exception as exc:
             print(f"第 {round_index} 次英雄技能点击异常，继续计时：{exc}")
 
-        if not wait_before_next_action(robot_wait, "释放机器小怪"):
-            return
-
         try:
-            release_robot_round(round_index, landing_point)
+            # 开场和英雄首次技能后各释放过一次，后续继续按次数轮换目标。
+            release_robot_round(round_index + 2, landing_point)
         except Exception as exc:
             print(f"第 {round_index} 次机器小怪点击异常，继续计时：{exc}")
 
@@ -647,14 +699,19 @@ def main():
     print("开始执行第一种海滩固定打法。")
     validate_profile()
 
-    print(f"已进入战斗界面，等待 {WAIT_FOR_BATTLE_START_SECONDS} 秒后直接寻找海滩。")
+    print(f"已进入战斗界面，等待 {WAIT_FOR_BATTLE_START_SECONDS} 秒后先缩小地图一次。")
     time.sleep(WAIT_FOR_BATTLE_START_SECONDS)
+    map_zoom.zoom_out_once(adb_command, dry_run=DRY_RUN)
 
     landing_reference = {}
     landing_point = search_landing_point(reference_out=landing_reference)
-    deploy_units_in_order(landing_point, landing_reference=landing_reference)
+    release_robot_round(1, landing_point)
+    print(f"开场机械小兵投放后，等待 {WAIT_AFTER_OPENING_ROBOT_SECONDS} 秒再开始登陆。")
+    time.sleep(WAIT_AFTER_OPENING_ROBOT_SECONDS)
+    last_hero_at = deploy_units_in_order(landing_point, landing_reference=landing_reference)
+    enable_triple_speed()
     release_shock_once()
-    release_robot_hero_cycle(landing_point)
+    release_robot_hero_cycle(landing_point, last_hero_at=last_hero_at)
 
     print("固定打法动作执行完成。后续等待结算脚本接管。")
 

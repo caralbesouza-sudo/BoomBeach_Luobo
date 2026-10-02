@@ -11,6 +11,7 @@ import click_confirm_attack
 import click_reinforce
 import click_replenish_troops as replenish_troops_module
 import click_result_return
+import debug_settings
 import skip_doctor_dialog
 import template_click
 import troop_status
@@ -34,10 +35,6 @@ AFTER_RESULT_RETURN_SECONDS = 1.5
 AFTER_DOCTOR_SKIP_SECONDS = 1.0
 AFTER_REINFORCE_CLICK_SECONDS = 1.0
 AFTER_REPLENISH_CLICK_SECONDS = 1.0
-AFTER_MAP_VIEW_MOVE_SECONDS = 1.0
-
-# 手指向左上拖动，地图视角会移向右下方。坐标避开底部兵种栏和右侧按钮。
-MAP_VIEW_BOTTOM_RIGHT_SWIPE = (720, 420, 470, 230, 480)
 
 CRAB_ENTRY_SEARCH_REGION = (250, 70, 850, 560)
 EXPECTED_SCREEN_SIZE = (1280, 720)
@@ -88,6 +85,9 @@ def validate_runtime():
     if missing:
         raise FileNotFoundError("缺少运行模板：\n" + "\n".join(missing))
 
+    # 进攻前检查双指触控支持和写入权限；这里只读检测，不发送手势。
+    battle_attack_profile.map_zoom.discover_touch_device(battle_attack_profile.adb_command)
+
     print(
         f"运行前检查通过：device={battle_attack_profile.ADB_SERIAL or 'default'}, "
         f"resolution={width}x{height}, templates={len(required_templates)}"
@@ -96,6 +96,8 @@ def validate_runtime():
 
 
 def save_error_screenshot(step_name):
+    if not debug_settings.SAVE_ERROR_SCREENSHOTS:
+        return None
     try:
         screen = battle_attack_profile.adb_screenshot()
     except Exception as exc:
@@ -192,11 +194,12 @@ def enter_crab():
 
     print(f"螃蟹入口匹配分数：{match.score:.3f}，模板：{match.template.name}，中心点：{match.center}")
     if match.score < template_click.MATCH_THRESHOLD:
-        output_dir = PROJECT_ROOT / "screenshots" / "errors"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        debug_path = output_dir / f"crab_entry_match_{now_text()}.png"
-        template_click.save_debug_match(screen, match, debug_path)
-        print(f"螃蟹入口匹配失败调试图：{debug_path}")
+        if debug_settings.SAVE_ERROR_SCREENSHOTS:
+            output_dir = PROJECT_ROOT / "screenshots" / "errors"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            debug_path = output_dir / f"crab_entry_match_{now_text()}.png"
+            template_click.save_debug_match(screen, match, debug_path)
+            print(f"螃蟹入口匹配失败调试图：{debug_path}")
         return False
 
     tap_with_module(template_click, match.center)
@@ -370,54 +373,38 @@ def capture_map_troop_snapshot(label):
     return troop_status.capture(screen, label)
 
 
-def move_map_view_bottom_right():
+def check_crab_entry():
     screen = battle_attack_profile.adb_screenshot()
     if is_on_crab_attack_page(screen):
-        print("当前已经在螃蟹进攻界面，不再移动世界地图视角。")
+        print("当前已经在螃蟹进攻界面。")
         return True
 
     if skip_doctor_dialog.is_dialog_visible(screen):
-        print("博士对话仍在显示，暂不移动世界地图视角。")
+        print("博士对话仍在显示，等待后重试入口识别。")
         return False
 
     map_ready, map_scores = troop_status.is_world_map_visible(screen)
     if not map_ready:
         print(
-            "当前不是稳定的世界地图界面，暂不拖动视角："
+            "当前不是稳定的世界地图界面，等待后重试入口识别："
             f"地图按钮分数={[round(value, 3) for value in map_scores]}"
         )
         return False
 
     match = find_crab_entry(screen)
     if match.score >= template_click.MATCH_THRESHOLD:
-        print(f"已找到螃蟹入口：score={match.score:.3f}, center={match.center}，跳过视角移动。")
+        print(f"已找到螃蟹入口：score={match.score:.3f}, center={match.center}。")
         return True
 
-    print(f"未识别到螃蟹入口：score={match.score:.3f}，移动视角后重新识别。")
-    start_x, start_y, end_x, end_y, duration_ms = MAP_VIEW_BOTTOM_RIGHT_SWIPE
-    print(
-        "向右下方移动世界地图视角："
-        f"手指 ({start_x}, {start_y}) -> ({end_x}, {end_y}), {duration_ms}ms"
-    )
-    battle_attack_profile.run_adb(
-        "shell",
-        "input",
-        "swipe",
-        str(start_x),
-        str(start_y),
-        str(end_x),
-        str(end_y),
-        str(duration_ms),
-    )
-    time.sleep(AFTER_MAP_VIEW_MOVE_SECONDS)
-    return True
+    print(f"未识别到螃蟹入口：score={match.score:.3f}，保持当前视角，等待后重试。")
+    return False
 
 
 def reached_pause_limit(stage_index):
     return PAUSE_AFTER_STAGES is not None and stage_index >= PAUSE_AFTER_STAGES
 
 
-def main():
+def main(): 
     print("开始自动打螃蟹稳健流程。")
     initial_screen = validate_runtime()
     before_troop_snapshot = None
@@ -443,7 +430,7 @@ def main():
             break
 
         stage_index += 1
-        retry_step("move_map_view_bottom_right", move_map_view_bottom_right)
+        retry_step("check_crab_entry", check_crab_entry)
         before_troop_snapshot = capture_map_troop_snapshot(f"before_stage_{stage_index}")
         retry_step("enter_crab_next_stage", enter_crab)
         time.sleep(1)
@@ -472,24 +459,20 @@ def parse_args():
 
 if __name__ == "__main__":
     # ===== 战斗技能节奏 =====
-    # 第一次下兵后，等待多少秒释放英雄技能。
-    battle_attack_profile.FIRST_HERO_SKILL_SECONDS = 10
+    # 从登陆后的第一次英雄技能起，间隔 3 秒再次释放。
+    battle_attack_profile.FIRST_HERO_SKILL_SECONDS = 3
 
-    # 第一次英雄技能后，等待多少秒释放机器小怪。
-    battle_attack_profile.FIRST_ROBOT_SKILL_SECONDS = 5
+    # 后续英雄技能点击之间的目标间隔（现实秒）。
+    battle_attack_profile.NEXT_HERO_SKILL_SECONDS = 3
 
-    # 后续每轮等待多少秒释放英雄技能。
-    battle_attack_profile.NEXT_HERO_SKILL_SECONDS = 10
-
-    # 后续每轮英雄技能后，等待多少秒释放机器小怪。
-    battle_attack_profile.NEXT_ROBOT_SKILL_SECONDS = 1
+    # 每次英雄技能后立即释放机械小兵。
 
     # 英雄技能/机器小怪循环释放几轮。
-    battle_attack_profile.ROBOT_HERO_CYCLE_ROUNDS = 6
+    battle_attack_profile.ROBOT_HERO_CYCLE_ROUNDS = 20
 
     # ===== 其它等待参数 =====
     # 战斗开始后最多等待多少秒识别结算返回按钮。
-    BATTLE_RESULT_TIMEOUT_SECONDS = 300
+    BATTLE_RESULT_TIMEOUT_SECONDS = 100
 
     args = parse_args()
     battle_attack_profile.ADB_PATH = args.adb

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import debug_settings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -131,6 +132,8 @@ def adb_tap(x, y):
 
 
 def save_debug(screen, button_match, close_match, decision, digit_count):
+    if not debug_settings.SAVE_ERROR_SCREENSHOTS:
+        return None
     debug = screen.copy()
 
     for region, color in [(BUTTON_SEARCH_REGION, (255, 0, 0)), (CLOSE_SEARCH_REGION, (255, 255, 0))]:

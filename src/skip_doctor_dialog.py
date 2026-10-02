@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import debug_settings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,8 @@ def is_dialog_visible(screen):
 
 
 def save_debug(screen, label="doctor_dialog_timeout"):
+    if not debug_settings.SAVE_ERROR_SCREENSHOTS:
+        return None
     output_dir = PROJECT_ROOT / "screenshots" / "errors"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{label}_{time.strftime('%Y%m%d_%H%M%S')}.png"
@@ -113,7 +116,8 @@ def main():
 
     if last_screen is not None and is_dialog_visible(last_screen):
         debug_path = save_debug(last_screen)
-        raise RuntimeError(f"博士对话在 {DISMISS_TIMEOUT_SECONDS:.0f} 秒内未清除：{debug_path}")
+        suffix = f"：{debug_path}" if debug_path else "（调试截图保存已关闭）"
+        raise RuntimeError(f"博士对话在 {DISMISS_TIMEOUT_SECONDS:.0f} 秒内未清除{suffix}")
 
     print(f"博士对话检测结束，共处理 {dismissed_pages} 页。")
     return True
